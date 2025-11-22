@@ -1846,9 +1846,10 @@ class NvidiaDevice(PciDevice, NvidiaDeviceInternal):
         if ppcie_mode == 0x1:
             self.fsp_rpc.prc_knob_check_and_write(PrcKnob.PRC_KNOB_ID_2.value, 0x0)
             self.fsp_rpc.prc_knob_check_and_write(PrcKnob.PRC_KNOB_ID_4.value, 0x0)
-            self.fsp_rpc.prc_knob_check_and_write(PrcKnob.PRC_KNOB_ID_34.value, 0x0)
             self.fsp_rpc.prc_knob_check_and_write(PrcKnob.PRC_KNOB_ID_CCD.value, 0x0)
             self.fsp_rpc.prc_knob_check_and_write(PrcKnob.PRC_KNOB_ID_CCM.value, 0x0)
+            if self.is_nvswitch() or self.is_hopper:
+                self.fsp_rpc.prc_knob_check_and_write(PrcKnob.PRC_KNOB_ID_34.value, 0x0)
 
         self.fsp_rpc.prc_knob_check_and_write(PrcKnob.PRC_KNOB_ID_BAR0_DECOUPLER.value, bar0_decoupler_val)
         self.fsp_rpc.prc_knob_check_and_write(PrcKnob.PRC_KNOB_ID_PPCIE.value, ppcie_mode)
@@ -1877,7 +1878,8 @@ class NvidiaDevice(PciDevice, NvidiaDeviceInternal):
         self._init_fsp_rpc()
         toggle_2 = self.fsp_rpc.prc_knob_read(PrcKnob.PRC_KNOB_ID_1.value) == 0x1
         toggle_4 = self.fsp_rpc.prc_knob_read(PrcKnob.PRC_KNOB_ID_3.value) == 0x1
-        toggle_34 = self.fsp_rpc.prc_knob_read(PrcKnob.PRC_KNOB_ID_33.value) == 0x1
+        toggle_34 = self.fsp_rpc.prc_knob_read(PrcKnob.PRC_KNOB_ID_33.value) == 0x1 and (self.is_nvswitch() or self.is_hopper)
+        prev_34_state = self.fsp_rpc.prc_knob_read(PrcKnob.PRC_KNOB_ID_34.value)
         toggle_cc = self.is_cc_query_supported
         info(f"{self} test PPCIE switching org_mode {org_mode} toggle_2 {toggle_2} toggle_4 {toggle_4} toggle_34 {toggle_34}")
 
@@ -1903,6 +1905,11 @@ class NvidiaDevice(PciDevice, NvidiaDeviceInternal):
                     raise GpuError(f"{self} PPCIE mode failed to switch to {mode} in iter {iter}. Current mode is {new_mode}")
                 debug(f"{self} PPCIE switched to {mode} in iter {iter}")
                 prev_mode = new_mode
+
+                if not toggle_34:
+                    knob_34_state = self.fsp_rpc.prc_knob_read(PrcKnob.PRC_KNOB_ID_34.value)
+                    if prev_34_state != knob_34_state:
+                        raise GpuError(f"{self} knob 34 changed unexpectedly in iter {iter}, from {prev_34_state} to {knob_34_state}")
 
         self.set_ppcie_mode(org_mode)
         self.reset_with_os()
@@ -3355,13 +3362,15 @@ class Gpu(NvidiaDevice):
             raise BrokenGpuError()
 
         if self.pmcBoot0 in [0xbadf0200, 0xbad00200]:
-            if self.is_blackwell_plus:
-                if (0x10de, 0) in self.dvsec_caps:
-                    sec_fault = self.config_read_dvsec_cap(0x10de, 0x0, 0x14)
-                else:
+            if self.is_hopper or self.is_blackwell_2xx:
+
+                sec_fault = self.config_read_vsec_cap(0x1, 0x1, 0x10)
+                if sec_fault is None:
                     sec_fault = 0xcafebad0
-            elif self.is_hopper:
-                sec_fault = self.config.read32(0x2b4)
+            elif self.is_blackwell_plus:
+                sec_fault = self.config_read_dvsec_cap(0x10de, 0x0, 0x14)
+                if sec_fault is None:
+                    sec_fault = 0xcafebad0
 
             debug(f"{self} boot {self.pmcBoot0:#x} sec fault {sec_fault:#x}")
             raise BrokenGpuErrorSecFault(self.pmcBoot0, sec_fault)
@@ -3808,7 +3817,8 @@ class Gpu(NvidiaDevice):
         if cc_mode == 0x1:
             self.fsp_rpc.prc_knob_check_and_write(PrcKnob.PRC_KNOB_ID_2.value, 0x0)
             self.fsp_rpc.prc_knob_check_and_write(PrcKnob.PRC_KNOB_ID_4.value, 0x0)
-            self.fsp_rpc.prc_knob_check_and_write(PrcKnob.PRC_KNOB_ID_34.value, 0x0)
+            if self.is_hopper:
+                self.fsp_rpc.prc_knob_check_and_write(PrcKnob.PRC_KNOB_ID_34.value, 0x0)
             if ppcie_supported:
                 self.fsp_rpc.prc_knob_check_and_write(PrcKnob.PRC_KNOB_ID_PPCIE.value, 0x0)
 
@@ -3891,12 +3901,30 @@ class Gpu(NvidiaDevice):
                 return True
         return False
 
+    def wait_for_bar_firewall_legacy(self):
+        assert self.is_blackwell_2xx
+
+        if (0x1, 0x1) in self.vsec_caps:
+            mask = (0x1<<24)
+            self.poll_register("bar_firewall", self.vsec_caps[0x1, 0x1] + 0x14, value=0x0, timeout=15, mask=mask, read_function=self.config.read32)
+            return
+
+        if self.read_bad_ok(0) == 0xffffffff:
+            warning(f"{self} missing the VSEC 1:1 cap and BAR firewall might be active, falling back to 3s sleep")
+            time.sleep(3)
+            if self.read_bad_ok(0) == 0xffffffff:
+                error(f"{self} BAR0 still broken after 3s sleep")
+                raise BrokenGpuErrorWithInfo("BAR0 not accessible and no VSEC 1:1 cap exposed")
+
     def wait_for_bar_firewall(self):
         assert self.is_blackwell_plus
 
+        if self.is_blackwell_2xx:
+            return self.wait_for_bar_firewall_legacy()
+
         if (0x10de, 0) in self.dvsec_caps:
             mask = (0x1<<20)
-            self.poll_register("bar_firewall", self.dvsec_caps[0x10de, 0] + 0x8, value=0x0, timeout=5, mask=mask, read_function=self.config.read32)
+            self.poll_register("bar_firewall", self.dvsec_caps[0x10de, 0] + 0x8, value=0x0, timeout=15, mask=mask, read_function=self.config.read32)
             return
 
         if self.read_bad_ok(0) == 0xffffffff:
@@ -4053,7 +4081,8 @@ class Gpu(NvidiaDevice):
         self._init_fsp_rpc()
         toggle_2 = self.fsp_rpc.prc_knob_read(PrcKnob.PRC_KNOB_ID_1.value) == 0x1
         toggle_4 = self.fsp_rpc.prc_knob_read(PrcKnob.PRC_KNOB_ID_3.value) == 0x1
-        toggle_34 = self.fsp_rpc.prc_knob_read(PrcKnob.PRC_KNOB_ID_33.value) == 0x1
+        toggle_34 = self.fsp_rpc.prc_knob_read(PrcKnob.PRC_KNOB_ID_33.value) == 0x1 and self.is_hopper
+        prev_34_state = self.fsp_rpc.prc_knob_read(PrcKnob.PRC_KNOB_ID_34.value)
         info(f"{self} test CC switching org_mode {org_mode} toggle_2 {toggle_2} toggle_4 {toggle_4} toggle_34 {toggle_34}")
 
         prev_mode = org_mode
@@ -4075,6 +4104,11 @@ class Gpu(NvidiaDevice):
                     raise GpuError(f"{self} CC mode failed to switch to {mode} in iter {iter}. Current mode is {new_mode}")
                 debug(f"{self} CC switched to {mode} in iter {iter}")
                 prev_mode = new_mode
+
+                if not toggle_34:
+                    knob_34_state = self.fsp_rpc.prc_knob_read(PrcKnob.PRC_KNOB_ID_34.value)
+                    if prev_34_state != knob_34_state:
+                        raise GpuError(f"{self} knob 34 changed unexpectedly in iter {iter}, from {prev_34_state} to {knob_34_state}")
 
         self.set_cc_mode(org_mode)
         self.reset_with_os()

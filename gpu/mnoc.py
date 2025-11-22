@@ -70,7 +70,9 @@ class GpuMnoc:
     def send_data(self, data):
         size = len(data) * 4
 
-        self.check_receive_mbox_errors()
+        # Before sending data, we just need to check for receive ready. Any
+        # errors would be about previous messages and we can ignore them. If we
+        # can trigger a new message it will clear the error.
         self.poll_for_receive_ready()
 
         msg_metadata = size

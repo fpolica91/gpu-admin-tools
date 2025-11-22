@@ -322,6 +322,9 @@ class PciDevice(Device):
         self.ext_caps = {}
         self.ext_caps_all = collections.defaultdict(list)
 
+        # VSEC capability map by vsec id and revision
+        self.vsec_caps = {}
+
         # DVSEC capability map by vendor and id
         self.dvsec_caps = {}
 
@@ -359,12 +362,25 @@ class PciDevice(Device):
             offset = (header >> 20) & 0xffc
             header = self.config.read32(offset)
 
+        for vsec_offset in self.ext_caps_all[0xb]:
+            header_1 = self.config.read32(vsec_offset + 0x4)
+            vsec_id = header_1 & 0xffff
+            vsec_rev = (header_1 >> 16) & 0xf
+            self.vsec_caps[(vsec_id, vsec_rev)] = vsec_offset
+
         for dvsec_offset in self.ext_caps_all[0x23]:
             header_1 = self.config.read32(dvsec_offset + 0x4)
             vendor = header_1 & 0xffff
             header_2 = self.config.read32(dvsec_offset + 0x8)
             dvsec_id = header_2 & 0xffff
             self.dvsec_caps[vendor, dvsec_id] = dvsec_offset
+
+    def config_read_vsec_cap(self, vsec_id, vsec_rev, offset_in_cap):
+        offset = self.vsec_caps.get((vsec_id, vsec_rev), None)
+        if offset is None:
+            return None
+
+        return self.config.read32(offset + offset_in_cap)
 
     def config_read_dvsec_cap(self, vendor, dvsec_id, offset_in_cap):
         offset = self.dvsec_caps.get((vendor, dvsec_id), None)

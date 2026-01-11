@@ -49,8 +49,9 @@ Repository = "https://github.com/fpolica91/gpu-admin-tools.git"
 
 [tool.hatch.build.targets.wheel]
 packages = ["cli", "gpu", "pci", "utils"]
-# Include the standalone nvidia_gpu_tools.py module
-include = ["nvidia_gpu_tools.py"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"nvidia_gpu_tools.py" = "nvidia_gpu_tools.py"
 
 [tool.hatch.build.targets.sdist]
 include = [
